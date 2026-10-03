@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: 2026 benelog GmbH & Co. KG
-"""Product and organization records: payloads, upsert, bulk onboarding, GPC.
+"""Product and organization records: payloads, upsert, reading back, GS1 import,
+bulk onboarding, GPC.
 
 - :mod:`~openepcis_client.masterdata.payload` builds the nested catalog document
   from dotted GS1 term paths and shapes the awkward value kinds;
@@ -13,8 +14,9 @@ from .service import (
     BulkReport,
     BulkRowError,
     GpcNode,
+    Gs1Record,
     InvalidKey,
     Masterdata,
 )
 
-__all__ = ["BulkReport", "BulkRowError", "GpcNode", "InvalidKey", "Masterdata"]
+__all__ = ["BulkReport", "BulkRowError", "GpcNode", "Gs1Record", "InvalidKey", "Masterdata"]

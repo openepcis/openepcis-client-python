@@ -9,6 +9,7 @@ from typing import Any
 import pytest
 
 from openepcis_client.core import gs1
+from openepcis_client.core.errors import OpenEpcisError
 from openepcis_client.masterdata import InvalidKey, Masterdata
 from openepcis_client.masterdata import service as service_module
 
@@ -169,3 +170,107 @@ class TestGpcSearch:
         assert len(nodes) == 1
         assert nodes[0].code == "10003269"
         assert nodes[0].lineage == "Furniture > ..."
+
+
+class ReadingClient:
+    """Answers GET and POST from a script keyed by path; raises where told to."""
+
+    def __init__(self, answers: dict[str, Any]) -> None:
+        self.answers = answers
+        self.calls: list[tuple[str, str, Any]] = []
+
+    def _answer(self, verb: str, path: str, params: Any) -> Any:
+        self.calls.append((verb, path, params))
+        answer = self.answers.get(path)
+        if isinstance(answer, OpenEpcisError):
+            raise answer
+        if callable(answer):
+            return answer(params)
+        return answer
+
+    def get(self, path: str, params: dict[str, Any] | None = None) -> Any:
+        return self._answer("GET", path, params)
+
+    def post(self, path: str, payload: Any = None) -> Any:
+        return self._answer("POST", path, payload)
+
+
+def not_found(path: str) -> OpenEpcisError:
+    return OpenEpcisError("not found", status=404, path=path)
+
+
+class TestReadingBack:
+    def test_an_organization_is_read_by_its_cleaned_gln(self) -> None:
+        client = ReadingClient({f"/organizations/{GLN}": {"organizationName": "Acme"}})
+        record = masterdata(client).get_organization(f" {GLN[:4]} {GLN[4:]} ")  # type: ignore[arg-type]
+        assert record == {"organizationName": "Acme"}
+        assert client.calls[0][1] == f"/organizations/{GLN}"
+
+    def test_an_unknown_gln_reads_as_none(self) -> None:
+        path = f"/organizations/{GLN}"
+        client = ReadingClient({path: not_found(path)})
+        assert masterdata(client).get_organization(GLN) is None  # type: ignore[arg-type]
+
+    def test_other_errors_are_not_swallowed(self) -> None:
+        path = f"/organizations/{GLN}"
+        client = ReadingClient({path: OpenEpcisError("down", status=503, path=path)})
+        with pytest.raises(OpenEpcisError):
+            masterdata(client).get_organization(GLN)  # type: ignore[arg-type]
+
+    def test_an_invalid_gln_is_refused_before_any_request(self) -> None:
+        client = ReadingClient({})
+        with pytest.raises(InvalidKey):
+            masterdata(client).get_organization(GLN[:-1] + str((int(GLN[-1]) + 1) % 10))  # type: ignore[arg-type]
+        assert client.calls == []
+
+    def test_the_walk_follows_the_pages_newest_change_first(self) -> None:
+        pages = {
+            1: {
+                "organizations": [{"globalLocationNumber": "a"}, {"globalLocationNumber": "b"}],
+                "totalPages": 2,
+            },
+            2: {"organizations": [{"globalLocationNumber": "c"}], "totalPages": 2},
+        }
+        client = ReadingClient({"/organizations": lambda params: pages[params["page"]]})
+        walked = list(masterdata(client).iter_organizations(page_size=2))  # type: ignore[arg-type]
+        assert [r["globalLocationNumber"] for r in walked] == ["a", "b", "c"]
+        first = client.calls[0][2]
+        assert first == {"page": 1, "pageSize": 2, "sortBy": "updatedAt", "sortOrder": "desc"}
+        assert len(client.calls) == 2
+
+    def test_an_empty_tenant_is_one_request_and_no_records(self) -> None:
+        client = ReadingClient({"/organizations": {"organizations": [], "totalPages": 0}})
+        assert list(masterdata(client).iter_organizations()) == []  # type: ignore[arg-type]
+        assert len(client.calls) == 1
+
+
+class TestGs1Import:
+    def test_a_gln_preview_carries_organization_and_place(self) -> None:
+        path = f"/masterdata/sync/{GLN}/preview"
+        answer = {
+            "key": GLN,
+            "type": "GLN",
+            "organization": {"organizationName": "Acme"},
+            "place": {"physicalLocationName": "Lager"},
+        }
+        client = ReadingClient({path: answer})
+        record = masterdata(client).preview_from_gs1(GLN)  # type: ignore[arg-type]
+        assert record is not None
+        assert record.key_type == "GLN"
+        assert record.organization == {"organizationName": "Acme"}
+        assert record.place == {"physicalLocationName": "Lager"}
+        assert record.product is None
+
+    def test_a_key_gs1_does_not_know_previews_as_none(self) -> None:
+        path = f"/masterdata/sync/{GLN}/preview"
+        client = ReadingClient({path: not_found(path)})
+        assert masterdata(client).preview_from_gs1(GLN) is None  # type: ignore[arg-type]
+
+    def test_import_reports_whether_anything_was_stored(self) -> None:
+        known = f"/masterdata/sync/{GLN}"
+        client = ReadingClient({known: {"status": "success"}})
+        assert masterdata(client).import_from_gs1(GLN) is True  # type: ignore[arg-type]
+        assert client.calls == [("POST", known, None)]
+
+        client = ReadingClient({known: not_found(known)})
+        assert masterdata(client).import_from_gs1(GLN) is False  # type: ignore[arg-type]

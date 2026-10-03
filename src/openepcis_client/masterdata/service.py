@@ -16,13 +16,17 @@ Two ways into the catalog, with different semantics:
 
 import csv
 import io
-from collections.abc import Iterable
+from collections.abc import Iterable, Iterator
 from dataclasses import dataclass
 from typing import Any
 
 from ..core import gs1
 from ..core.client import Client
+from ..core.errors import OpenEpcisError
 from . import vocabulary
+
+#: Records per page when walking a list.
+LIST_PAGE_SIZE = 100
 
 #: Rows per CSV upload. Keeps every chunk well under the endpoint's 10 MB cap,
 #: so a chunk cannot be refused for size.
@@ -83,6 +87,24 @@ class BulkReport:
 
 
 @dataclass(frozen=True)
+class Gs1Record:
+    """The catalog records GS1 Germany's answer for one key derives into.
+
+    A GTIN derives a product. A GLN derives an organization, a place, or both,
+    because GS1 describes a party and its location under one number; at least
+    one of the two is present.
+    """
+
+    key: str
+    key_type: str
+    """``GTIN`` or ``GLN``, as the server classified the key."""
+
+    product: dict[str, Any] | None = None
+    organization: dict[str, Any] | None = None
+    place: dict[str, Any] | None = None
+
+
+@dataclass(frozen=True)
 class GpcNode:
     """One node of the GS1 Global Product Classification."""
 
@@ -121,6 +143,122 @@ class Masterdata:
         # their own — e.g. ["Product", "TextileApparel"] — are left alone.
         payload.setdefault("type", kind.record_type)
         return self._client.put(f"{kind.endpoint}/{cleaned}", payload)
+
+    # -- Reading back --------------------------------------------------------
+
+    def get_organization(self, gln: str) -> dict[str, Any] | None:
+        """One organization of the caller's tenant, or ``None`` when it holds none.
+
+        The read is scoped to the tenant server side, so a GLN another tenant
+        holds answers ``None`` exactly like one nobody holds.
+        """
+        return self._get_record(vocabulary.kind("ORGANIZATION"), gln)
+
+    def iter_organizations(
+        self,
+        page_size: int = LIST_PAGE_SIZE,
+        sort_by: str = "updatedAt",
+        order: str = "desc",
+    ) -> Iterator[dict[str, Any]]:
+        """Every organization of the caller's tenant, page by page.
+
+        The default order is most recently changed first. The resolver sorts
+        by its change time but does not return it, so there is no cursor to
+        resume from: a synchroniser walks the whole list and compares each
+        record with what it last saw (a payload hash, say). That is fine for
+        the few hundred parties a tenant holds; a ``modifiedSince`` filter on
+        the server is the step after.
+
+        Pages are fetched lazily. A record changed while the walk is under way
+        can move between pages and be seen twice or not at all in this walk;
+        the next walk sees it.
+        """
+        kind = vocabulary.kind("ORGANIZATION")
+        page = 1
+        while True:
+            answer = (
+                self._client.get(
+                    kind.endpoint,
+                    params={
+                        "page": page,
+                        "pageSize": page_size,
+                        "sortBy": sort_by,
+                        "sortOrder": order,
+                    },
+                )
+                or {}
+            )
+            records = answer.get("organizations") or []
+            yield from records
+            total_pages = int(answer.get("totalPages") or 0)
+            if not records or page >= total_pages:
+                return
+            page += 1
+
+    def _get_record(self, kind: vocabulary.Kind, key: str) -> dict[str, Any] | None:
+        cleaned = gs1.clean(key)
+        problem = gs1.problem_with(cleaned, kind.key_type)
+        if problem:
+            raise InvalidKey(key, problem)
+        try:
+            answer = self._client.get(f"{kind.endpoint}/{cleaned}")
+        except OpenEpcisError as exc:
+            if exc.status == 404:
+                return None
+            raise
+        return dict(answer) if answer else None
+
+    # -- Import from GS1 -----------------------------------------------------
+
+    def preview_from_gs1(self, key: str) -> Gs1Record | None:
+        """What GS1 Germany knows about a key, derived into a catalog record.
+
+        Read-only: nothing is stored. ``None`` when GS1 does not know the key.
+        Keys in the GS1 example range (``952…``) are refused by the server with
+        a 400, because Verified by GS1 does not answer for them.
+        """
+        cleaned = gs1.clean(key)
+        try:
+            answer = self._client.get(f"/masterdata/sync/{cleaned}/preview")
+        except OpenEpcisError as exc:
+            if exc.status == 404:
+                return None
+            raise
+        return self._gs1_record(cleaned, answer or {})
+
+    def import_from_gs1(self, key: str) -> bool:
+        """Store what GS1 Germany knows about a key under the caller's tenant.
+
+        Writes a product, place or organization, whichever the key is. Single
+        attempt, as every ``POST`` through the client: the server answers what
+        it did, and a repeat after a lost answer is harmless but not ours to
+        decide.
+
+        :returns: ``True`` when the record was stored, ``False`` when GS1 does
+            not know the key.
+        """
+        cleaned = gs1.clean(key)
+        try:
+            self._client.post(f"/masterdata/sync/{cleaned}")
+        except OpenEpcisError as exc:
+            if exc.status == 404:
+                return False
+            raise
+        return True
+
+    @staticmethod
+    def _gs1_record(key: str, answer: dict[str, Any]) -> Gs1Record:
+        def part(name: str) -> dict[str, Any] | None:
+            value = answer.get(name)
+            return dict(value) if isinstance(value, dict) else None
+
+        return Gs1Record(
+            key=str(answer.get("key") or key),
+            key_type=str(answer.get("type") or ""),
+            product=part("product"),
+            organization=part("organization"),
+            place=part("place"),
+        )
 
     # -- Bulk onboarding -----------------------------------------------------
 
