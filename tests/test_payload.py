@@ -4,7 +4,14 @@
 
 import pytest
 
-from openepcis_client.masterdata.payload import boolean_text, localized, place, quantity
+from openepcis_client.masterdata.payload import (
+    boolean_text,
+    localized,
+    pick,
+    pick_localized,
+    place,
+    quantity,
+)
 
 
 class TestPlace:
@@ -70,3 +77,46 @@ class TestShapes:
 
     def test_localized_with_nothing_left_is_none(self) -> None:
         assert localized({"de": ""}) is None
+
+
+class TestPick:
+    def test_a_nested_value(self) -> None:
+        document = {"address": {"postalCode": "50825"}}
+        assert pick(document, "address.postalCode") == "50825"
+
+    def test_a_list_segment_reads_the_first_element(self) -> None:
+        document = {"contactPoint": [{"email": "a@example.test"}, {"email": "b@example.test"}]}
+        assert pick(document, "contactPoint[].email") == "a@example.test"
+
+    def test_what_place_writes_pick_reads(self) -> None:
+        document: dict[str, object] = {}
+        place(document, "address.addressCountry.countryCode", "DE")
+        assert pick(document, "address.addressCountry.countryCode") == "DE"
+
+    @pytest.mark.parametrize(
+        "document",
+        [{}, {"address": None}, {"address": "Maarweg"}, {"contactPoint": []}],
+    )
+    def test_anything_missing_on_the_way_is_none(self, document: dict[str, object]) -> None:
+        assert pick(document, "address.postalCode") is None
+        assert pick(document, "contactPoint[].email") is None
+
+    def test_an_unusable_path_is_a_configuration_error(self) -> None:
+        with pytest.raises(ValueError):
+            pick({}, "address..postalCode")
+
+
+class TestPickLocalized:
+    def test_the_preferred_language_wins(self) -> None:
+        assert pick_localized({"en": "Chair", "de": "Stuhl"}, ("de",)) == "Stuhl"
+
+    def test_english_then_anything(self) -> None:
+        assert pick_localized({"fr": "Chaise", "en": "Chair"}, ("de",)) == "Chair"
+        assert pick_localized({"fr": "Chaise"}, ("de",)) == "Chaise"
+
+    def test_plain_text_passes_through(self) -> None:
+        assert pick_localized(" Stuhl ") == "Stuhl"
+
+    def test_nothing_readable_is_none(self) -> None:
+        assert pick_localized({"de": " "}) is None
+        assert pick_localized(None) is None
